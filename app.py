@@ -15,9 +15,8 @@ app = Flask(__name__)
 # =========================
 # Config (Render Env Vars)
 # =========================
-# ✅ FIX: Read WEBHOOK_SECRET first, fallback to SECRET (compat)
+# ✅ Uses WEBHOOK_SECRET first, fallback to SECRET (compat)
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or os.getenv("SECRET") or "").strip()
-
 TG_TOKEN = (os.getenv("TG_TOKEN") or "").strip()
 TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or "").strip()
 
@@ -49,7 +48,6 @@ def in_trade_window(dt: datetime) -> bool:
     if ENFORCE_HOURS != "1":
         return True
     t = dt.time()
-    # inclusive start, inclusive end
     return (t >= TRADE_START) and (t <= TRADE_END)
 
 def tg_send(text: str):
@@ -62,21 +60,21 @@ def tg_send(text: str):
         pass
 
 def check_secret(payload_secret: str | None, header_secret: str | None, query_secret: str | None) -> bool:
-    """
-    ✅ FIX: validate against WEBHOOK_SECRET (loaded from WEBHOOK_SECRET or SECRET)
-    Safety: if no secret configured, reject all requests.
-    """
+    # Safety: if secret not configured, reject everything.
     if not WEBHOOK_SECRET:
         return False
     candidate = (payload_secret or header_secret or query_secret or "").strip()
     return candidate == WEBHOOK_SECRET
 
 def normalize_action(a: str) -> str:
+    # ✅ FIX: Support CLOSE
     a = (a or "").strip().upper()
     if a in ("BUY", "LONG"):
         return "BUY"
     if a in ("SELL", "SHORT"):
         return "SELL"
+    if a in ("CLOSE", "EXIT", "FLAT"):
+        return "CLOSE"
     return ""
 
 def safe_float(x):
@@ -104,6 +102,12 @@ def build_signal(data: dict) -> dict:
     sig_id = (data.get("id") or data.get("signal_id") or str(uuid.uuid4())[:8]).strip()
     ts = now_pr().isoformat()
 
+    # Optional close controls (EA may use these if you implement them):
+    close_side = (data.get("close_side") or data.get("close") or "ALL")
+    close_side = (str(close_side).strip().upper() if close_side is not None else "ALL")
+    if close_side not in ("ALL", "BUY", "SELL"):
+        close_side = "ALL"
+
     return {
         "id": sig_id,
         "ts": ts,
@@ -114,6 +118,7 @@ def build_signal(data: dict) -> dict:
         "tp": tp,
         "comment": comment,
         "magic": magic,
+        "close_side": close_side,
         "raw": data,
     }
 
@@ -137,7 +142,7 @@ def parse_body_to_dict():
             pass
 
     # Pipe format: BUY|XAUUSD|0.01|SL|TP
-    if "|" in body and ("BUY" in body.upper() or "SELL" in body.upper()):
+    if "|" in body and ("BUY" in body.upper() or "SELL" in body.upper() or "CLOSE" in body.upper()):
         parts = [p.strip() for p in body.split("|")]
         d = {}
         if len(parts) >= 1: d["action"] = parts[0]
@@ -161,7 +166,8 @@ def root():
         "service": "tv-mt4-bridge",
         "ok": True,
         "endpoints": ["/health", "/webhook (POST)", "/pull", "/latest"],
-        "trade_window_pr": {"start": START_HHMM, "end": END_HHMM, "enforced": ENFORCE_HOURS == "1"}
+        "trade_window_pr": {"start": START_HHMM, "end": END_HHMM, "enforced": ENFORCE_HOURS == "1"},
+        "actions_supported": ["BUY", "SELL", "CLOSE"]
     })
 
 @app.get("/health")
@@ -169,7 +175,7 @@ def health():
     return jsonify({
         "ok": True,
         "time_pr": now_pr().isoformat(),
-        "has_secret": bool(WEBHOOK_SECRET),   # ✅ FIX
+        "has_secret": bool(WEBHOOK_SECRET),
         "pending": STATE["pending"] is not None,
         "latest": STATE["last"]["id"] if STATE["last"] else None
     })
@@ -196,13 +202,16 @@ def webhook():
 
     sig = build_signal(data)
     if not sig["action"]:
-        return jsonify({"ok": False, "error": "missing_action_BUY_or_SELL"}), 400
+        return jsonify({"ok": False, "error": "missing_action_BUY_SELL_or_CLOSE"}), 400
 
     # Store last + pending (one-shot)
     STATE["last"] = sig
     STATE["pending"] = sig
 
-    tg_send(f"✅ TV Signal received: {sig['action']} {sig['symbol']} lots={sig['lots']} sl={sig['sl']} tp={sig['tp']} id={sig['id']}")
+    if sig["action"] == "CLOSE":
+        tg_send(f"🟠 TV Signal received: CLOSE {sig['symbol']} close_side={sig['close_side']} id={sig['id']}")
+    else:
+        tg_send(f"✅ TV Signal received: {sig['action']} {sig['symbol']} lots={sig['lots']} sl={sig['sl']} tp={sig['tp']} id={sig['id']}")
 
     return jsonify({"ok": True, "stored": True, "id": sig["id"], "time_pr": sig["ts"]})
 
@@ -238,11 +247,16 @@ def pull():
     STATE["pending"] = None
 
     if fmt == "txt":
-        # OK|id|action|symbol|lots|sl|tp|ts|magic|comment
+        # OK|id|action|symbol|lots|sl|tp|ts|magic|comment|close_side
         sl = "" if sig["sl"] is None else str(sig["sl"])
         tp = "" if sig["tp"] is None else str(sig["tp"])
         comment = (sig.get("comment") or "").replace("|", " ")
-        out = f"OK|{sig['id']}|{sig['action']}|{sig['symbol']}|{sig['lots']}|{sl}|{tp}|{sig['ts']}|{sig['magic']}|{comment}"
+        close_side = (sig.get("close_side") or "ALL").replace("|", " ")
+
+        out = (
+            f"OK|{sig['id']}|{sig['action']}|{sig['symbol']}|{sig['lots']}|"
+            f"{sl}|{tp}|{sig['ts']}|{sig['magic']}|{comment}|{close_side}"
+        )
         return Response(out, mimetype="text/plain")
 
     return jsonify({"ok": True, "pending": sig})
