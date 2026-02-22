@@ -15,15 +15,17 @@ app = Flask(__name__)
 # =========================
 # Config (Render Env Vars)
 # =========================
-SECRET = os.getenv("SECRET", "").strip()
-TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+# ✅ FIX: Read WEBHOOK_SECRET first, fallback to SECRET (compat)
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or os.getenv("SECRET") or "").strip()
+
+TG_TOKEN = (os.getenv("TG_TOKEN") or "").strip()
+TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or "").strip()
 
 # Trading window (Puerto Rico)
 TZ = ZoneInfo("America/Puerto_Rico")
-ENFORCE_HOURS = os.getenv("ENFORCE_HOURS", "1").strip()  # "1" = on, "0" = off
-START_HHMM = os.getenv("TRADE_START", "05:00").strip()   # 05:00
-END_HHMM = os.getenv("TRADE_END", "16:00").strip()       # 16:00
+ENFORCE_HOURS = (os.getenv("ENFORCE_HOURS") or "1").strip()  # "1" = on, "0" = off
+START_HHMM = (os.getenv("TRADE_START") or "05:00").strip()   # 05:00
+END_HHMM = (os.getenv("TRADE_END") or "16:00").strip()       # 16:00
 
 def parse_hhmm(s: str) -> time:
     hh, mm = s.split(":")
@@ -60,11 +62,14 @@ def tg_send(text: str):
         pass
 
 def check_secret(payload_secret: str | None, header_secret: str | None, query_secret: str | None) -> bool:
-    if not SECRET:
-        # If you forgot to set SECRET in Render, allow nothing for safety.
+    """
+    ✅ FIX: validate against WEBHOOK_SECRET (loaded from WEBHOOK_SECRET or SECRET)
+    Safety: if no secret configured, reject all requests.
+    """
+    if not WEBHOOK_SECRET:
         return False
     candidate = (payload_secret or header_secret or query_secret or "").strip()
-    return candidate == SECRET
+    return candidate == WEBHOOK_SECRET
 
 def normalize_action(a: str) -> str:
     a = (a or "").strip().upper()
@@ -164,7 +169,7 @@ def health():
     return jsonify({
         "ok": True,
         "time_pr": now_pr().isoformat(),
-        "has_secret": bool(SECRET),
+        "has_secret": bool(WEBHOOK_SECRET),   # ✅ FIX
         "pending": STATE["pending"] is not None,
         "latest": STATE["last"]["id"] if STATE["last"] else None
     })
